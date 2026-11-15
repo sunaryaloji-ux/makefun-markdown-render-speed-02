@@ -697,6 +697,27 @@ function tokBlockquote(src, st) {
   return { type: 'blockquote', raw, tokens, text };
 }
 
+// A line can only interrupt a list item when it starts with a construct's
+// first character: space/tab (indented variants), >, #, `, ~, *, -, +, a
+// digit (ordered bullet) or <. Anything else is plain item text, and the
+// six interrupt regexes below cannot match it.
+function lineCouldInterrupt(line) {
+  const c = line.charCodeAt(0);
+  return (
+    c === 32 ||
+    c === 9 ||
+    c === 62 ||
+    c === 35 ||
+    c === 96 ||
+    c === 126 ||
+    c === 42 ||
+    c === 45 ||
+    c === 43 ||
+    (c >= 48 && c <= 57) ||
+    c === 60
+  );
+}
+
 function tokList(src, st) {
   const first = reListStart.exec(src);
   if (!first) return null;
@@ -751,12 +772,13 @@ function tokList(src, st) {
         const line = src.split('\n', 1)[0];
         let expanded;
         if (
-          fencesAt.test(line) ||
-          headingAt.test(line) ||
-          htmlAt.test(line) ||
-          quoteAt.test(line) ||
-          nextBullet.test(line) ||
-          hrAt.test(line)
+          lineCouldInterrupt(line) &&
+          (fencesAt.test(line) ||
+            headingAt.test(line) ||
+            htmlAt.test(line) ||
+            quoteAt.test(line) ||
+            nextBullet.test(line) ||
+            hrAt.test(line))
         ) {
           break;
         }
@@ -767,10 +789,11 @@ function tokList(src, st) {
           if (
             blankFirst ||
             content.replace(reTabGlobal, '    ').search(reNonSpace) >= 4 ||
-            fencesAt.test(content) ||
-            headingAt.test(content) ||
-            htmlAt.test(content) ||
-            hrAt.test(content)
+            (lineCouldInterrupt(content) &&
+              (fencesAt.test(content) ||
+                headingAt.test(content) ||
+                htmlAt.test(content) ||
+                hrAt.test(content)))
           ) {
             break;
           }
@@ -1463,6 +1486,10 @@ function tokInlineText(src, st) {
 
 // The inline loop: try each construct in order, in a masked copy of the source
 // for the emphasis scans. Text tokens merge with a preceding text token.
+// Dispatch is by first character: each construct can only start on a few
+// characters, so most positions try exactly two tokenisers (the one that can
+// match here, then text) instead of all ten. The try order inside each group
+// is the same as the old sequential order, so behaviour is unchanged.
 function inlineTokens(src, tokens, st) {
   const savedParen = st.linkParenPossible;
   st.linkParenPossible = savedParen && src.includes(')');
@@ -1482,58 +1509,71 @@ function inlineTokens(src, tokens, st) {
       if (!prevWasText) prevChar = '';
       prevWasText = false;
       let tok;
-      if ((tok = tokEscape(rest))) {
-        rest = rest.slice(tok.raw.length);
-        tokens.push(tok);
-        continue;
-      }
-      if ((tok = tokInlineTag(rest, st))) {
-        rest = rest.slice(tok.raw.length);
-        tokens.push(tok);
-        continue;
-      }
-      if ((tok = tokInlineLink(rest, st))) {
-        rest = rest.slice(tok.raw.length);
-        tokens.push(tok);
-        continue;
-      }
-      if ((tok = tokRefLink(rest, st))) {
-        rest = rest.slice(tok.raw.length);
-        const prev = tokens[tokens.length - 1];
-        if (tok.type === 'text' && prev && prev.type === 'text') {
-          prev.raw += tok.raw;
-          prev.text += tok.text;
-        } else {
+      const ch = rest[0];
+      if (ch === '\\') {
+        if ((tok = tokEscape(rest))) {
+          rest = rest.slice(tok.raw.length);
           tokens.push(tok);
+          continue;
         }
-        continue;
-      }
-      if ((tok = tokEmStrong(rest, masked, prevChar, closers, st))) {
-        rest = rest.slice(tok.raw.length);
-        tokens.push(tok);
-        continue;
-      }
-      if ((tok = tokCodeSpan(rest))) {
-        rest = rest.slice(tok.raw.length);
-        tokens.push(tok);
-        continue;
-      }
-      if ((tok = tokBr(rest))) {
-        rest = rest.slice(tok.raw.length);
-        tokens.push(tok);
-        continue;
-      }
-      if ((tok = tokDel(rest, masked, prevChar, closers, st))) {
-        rest = rest.slice(tok.raw.length);
-        tokens.push(tok);
-        continue;
-      }
-      if ((tok = tokAutolink(rest))) {
-        rest = rest.slice(tok.raw.length);
-        tokens.push(tok);
-        continue;
-      }
-      if (!st.inLink && (tok = tokExtUrl(rest))) {
+        if ((tok = tokBr(rest))) {
+          rest = rest.slice(tok.raw.length);
+          tokens.push(tok);
+          continue;
+        }
+      } else if (ch === '<') {
+        if ((tok = tokInlineTag(rest, st))) {
+          rest = rest.slice(tok.raw.length);
+          tokens.push(tok);
+          continue;
+        }
+        if ((tok = tokAutolink(rest))) {
+          rest = rest.slice(tok.raw.length);
+          tokens.push(tok);
+          continue;
+        }
+      } else if (ch === '[' || ch === '!') {
+        if ((tok = tokInlineLink(rest, st))) {
+          rest = rest.slice(tok.raw.length);
+          tokens.push(tok);
+          continue;
+        }
+        if ((tok = tokRefLink(rest, st))) {
+          rest = rest.slice(tok.raw.length);
+          const prev = tokens[tokens.length - 1];
+          if (tok.type === 'text' && prev && prev.type === 'text') {
+            prev.raw += tok.raw;
+            prev.text += tok.text;
+          } else {
+            tokens.push(tok);
+          }
+          continue;
+        }
+      } else if (ch === '*' || ch === '_') {
+        if ((tok = tokEmStrong(rest, masked, prevChar, closers, st))) {
+          rest = rest.slice(tok.raw.length);
+          tokens.push(tok);
+          continue;
+        }
+      } else if (ch === '`') {
+        if ((tok = tokCodeSpan(rest))) {
+          rest = rest.slice(tok.raw.length);
+          tokens.push(tok);
+          continue;
+        }
+      } else if (ch === ' ') {
+        if ((tok = tokBr(rest))) {
+          rest = rest.slice(tok.raw.length);
+          tokens.push(tok);
+          continue;
+        }
+      } else if (ch === '~') {
+        if ((tok = tokDel(rest, masked, prevChar, closers, st))) {
+          rest = rest.slice(tok.raw.length);
+          tokens.push(tok);
+          continue;
+        }
+      } else if (!st.inLink && (tok = tokExtUrl(rest))) {
         rest = rest.slice(tok.raw.length);
         tokens.push(tok);
         continue;
