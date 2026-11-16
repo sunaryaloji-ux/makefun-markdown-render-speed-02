@@ -854,11 +854,37 @@ export function parse(md) {
     if (rest === '') contentIndent = ind + markerLen + 1;
     else if (spaces >= 5) contentIndent = ind + markerLen + 1;
     else contentIndent = col;
-    return { ordered, start, bullet, markerLen, rest, contentIndent, markerCol: ind };
+    return { ordered, start, bullet, markerLen, rest, contentIndent, markerCol: ind, spaces };
   }
   // can a list marker interrupt a paragraph? (bullet, or ordered starting at 1, and non-empty item)
   function listCanInterrupt(m) {
     return (!m.ordered || m.start === 1) && m.rest !== '';
+  }
+  // isPrevBlockStart(content): fence/heading/html(1-6)/HR start on already-stripped content
+  // (marked's lazy-block test: previous item line must not start one of these).
+  function isPrevBlockStart(c) {
+    const fm0 = /^(`{3,}|~{3,})/.exec(c);
+    if (fm0) {
+      const info0 = c.slice(fm0[1].length).trim();
+      if (!(fm0[1][0] === '`' && info0.includes('`'))) return true;
+    }
+    if (/^(#{1,6})(?:[ \t]+|[ \t]*$)/.test(c)) return true;
+    if (isHRLine(c)) return true;
+    const ht = htmlBlockType(c);
+    if (ht >= 1 && ht <= 6) return true;
+    return false;
+  }
+  // listBreakLine(line, ci): does this raw line start a block at indent < ci that ends
+  // a list item? (marked's break tests use ^ {0,min(ci-1,3)} anchoring; a line with
+  // indent >= 4 never breaks, and lines at indent >= ci join.)
+  function listBreakLine(l, ci) {
+    const ind = indentCols(l);
+    if (ind >= ci || ind > 3) return false;
+    const c = stripCols(l, ind);
+    if (isPrevBlockStart(c)) return true;
+    if (c[0] === '>') return true;
+    if (matchListMarker(l, ind)) return true;
+    return false;
   }
   // isInterrupt(content, ind): can this line start a block that interrupts a paragraph?
   // (a backtick fence whose info string contains a backtick is not a fence at all)
@@ -988,16 +1014,22 @@ export function parse(md) {
     if (!refs.has(key)) refs.set(key, { dest, title });
     return consumed;
   }
-  // lexLines(lines, i0, i1, refs, lazySet, nextLine): block-lex a line range.
+  // lexLines(lines, i0, i1, refs, lazySet, nextLine, top): block-lex a line range.
   // lazySet: indices (into lines) of lazy continuation lines (setext does not apply to them).
   // nextLine: the line following this range in the outer context (null at EOF).
-  function lexLines(lines, i0, i1, refs, lazySet, nextLine) {
+  // top: true at blockquote/top level (paragraphs keep continuation indent);
+  //   false inside list items (a paragraph continuation with indent >= 4 loses 4 cols,
+  //   marked's indented-code-merge). Sets nodes.looseDef when a blank-separated link
+  //   reference definition (which pushes no node) follows a block in this range.
+  function lexLines(lines, i0, i1, refs, lazySet, nextLine, top = true) {
     const nodes = [];
     const lazy = lazySet || new Set();
+    let sawBlank = false; // blank line(s) seen since the last pushed node
+    const push = (nd) => { if (sawBlank) nd.blankBefore = true; sawBlank = false; nodes.push(nd); };
     let i = i0;
     while (i < i1) {
       const line = lines[i];
-      if (blankLine(line)) { i++; continue; }
+      if (blankLine(line)) { sawBlank = true; i++; continue; }
       const ind = indentCols(line);
       if (ind >= 4) {
         const cl = [];
@@ -1013,7 +1045,7 @@ export function parse(md) {
           if (indentCols(l2) >= 4) { cl.push(stripCols(l2, 4)); j++; continue; }
           break;
         }
-        nodes.push({ t: 'code', lang: null, c: cl.join('\n') + '\n' });
+        push({ t: 'code', lang: null, c: cl.join('\n') + '\n' });
         i = j;
         continue;
       }
@@ -1037,7 +1069,7 @@ export function parse(md) {
           let c = cl.join('\n');
           if (cl.length && cl[cl.length - 1] !== '') c += '\n';
           const lang = info.split(/[ \t]+/)[0] || null;
-          nodes.push({ t: 'code', lang, c });
+          push({ t: 'code', lang, c });
           i = j;
           continue;
         }
@@ -1046,12 +1078,12 @@ export function parse(md) {
       if (hm) {
         let text = content.slice(hm[0].length);
         text = text.replace(/[ \t]+#+[ \t]*$/, '').replace(/[ \t]+$/, '');
-        nodes.push({ t: 'h', l: hm[1].length, c: text });
+        push({ t: 'h', l: hm[1].length, c: text });
         i++;
         continue;
       }
       if (isHRLine(content)) {
-        nodes.push({ t: 'hr' });
+        push({ t: 'hr' });
         i++;
         continue;
       }
@@ -1076,25 +1108,27 @@ export function parse(md) {
         }
         let c = hl.join('\n');
         if (j >= i1 ? srcEndsNL : !blankLine(lines[j])) c += '\n';
-        nodes.push({ t: 'html', c });
+        push({ t: 'html', c });
         i = j;
         continue;
       }
       if (ind <= 3 && line[ind] === '>') {
         const res = parseQuote(lines, i, i1, refs);
-        nodes.push(res.node);
+        push(res.node);
         i = res.next;
         continue;
       }
       const lm = matchListMarker(line, ind);
       if (lm) {
         const res = parseList(lines, i, i1, refs);
-        nodes.push(res.node);
+        push(res.node);
         i = res.next;
         continue;
       }
       // paragraph (with leading link reference definitions)
-      i = parseParagraph(lines, i, i1, refs, lazy, nodes);
+      const beforeLen = nodes.length, beforeSaw = sawBlank;
+      i = parseParagraph(lines, i, i1, refs, lazy, push, top);
+      if (beforeSaw && nodes.length === beforeLen && nodes.length > 0) nodes.looseDef = true;
     }
     return nodes;
   }
@@ -1106,6 +1140,27 @@ export function parse(md) {
     let inPara = false;
     let fence = null; // {ch, len}
     let html = null; // {end} end: 'blank' | marker string | 'tag'
+    // is the innermost content of a (possibly nested) list/quote marker line paragraph text?
+    const innermostPara = (l) => {
+      let cur = l;
+      for (let guard = 0; guard < 8; guard++) {
+        if (blankLine(cur)) return false;
+        const ind = indentCols(cur);
+        if (ind >= 4) return false;
+        const c = stripCols(cur, ind);
+        const fm = /^(`{3,}|~{3,})/.exec(c);
+        if (fm && !(fm[1][0] === '`' && c.slice(fm[1].length).trim().includes('`'))) return false;
+        if (/^(#{1,6})(?:[ \t]+|[ \t]*$)/.test(c)) return false;
+        if (isHRLine(c)) return false;
+        if (htmlBlockType(c) >= 1 && htmlBlockType(c) <= 6) return false;
+        if (isSetextLine(cur)) return false;
+        const mm = matchListMarker(cur, ind);
+        if (mm) { cur = dropCols(cur, mm.contentIndent); continue; }
+        if (c[0] === '>') { cur = c.slice(1).replace(/^[ \t]/, ''); continue; }
+        return true;
+      }
+      return false;
+    };
     const noteLine = (l) => {
       if (fence) {
         const ind = indentCols(l);
@@ -1145,7 +1200,15 @@ export function parse(md) {
       }
       if (isSetextLine(l)) { inPara = false; return; }
       const m = matchListMarker(l, ind);
-      if (m && listCanInterrupt(m)) { inPara = false; return; }
+      if (m) {
+        if (inPara) {
+          if (listCanInterrupt(m)) { inPara = false; return; }
+          inPara = true; return;
+        }
+        // no paragraph open: the list opens; its innermost content decides
+        inPara = innermostPara(dropCols(l, m.contentIndent));
+        return;
+      }
       inPara = true;
     };
     while (j < i1) {
@@ -1161,10 +1224,22 @@ export function parse(md) {
         continue;
       }
       if (blankLine(lq)) { inner.push(''); noteLine(''); j++; continue; }
-      if (inPara && !isInterrupt(stripCols(lq, Math.min(indq, 3)), indq) && !isHRLine(stripCols(lq, Math.min(indq, 3))) && !isSetextLine(lq)) {
-        inner.push(lq);
-        innerLazy.add(inner.length - 1);
-        noteLine(lq);
+      if (inPara && !isInterrupt(stripCols(lq, Math.min(indq, 3)), indq) && !isHRLine(stripCols(lq, Math.min(indq, 3)))) {
+        if (isSetextLine(lq)) {
+          // lazy setext line: 4 spaces when it follows a lazy line in the same
+          // chunk, else raw + lazy mark (it must not form a heading either way)
+          if (innerLazy.has(inner.length - 1)) {
+            inner.push('    ' + stripCols(lq, Math.min(indq, 3)));
+          } else {
+            inner.push(lq);
+            innerLazy.add(inner.length - 1);
+          }
+          inPara = true; // the paragraph continues past a lazy setext line
+        } else {
+          inner.push(lq);
+          innerLazy.add(inner.length - 1);
+          noteLine(lq);
+        }
         j++;
         continue;
       }
@@ -1187,11 +1262,16 @@ export function parse(md) {
       while (k < i1 && blankLine(lines[k])) { blanks++; k++; }
       if (k >= i1) break;
       const m = matchListMarker(lines[k], indentCols(lines[k]));
-      if (!m || m.ordered !== ordered || m.bullet !== bullet || indentCols(lines[k]) !== markerCol) break;
+      if (!m || m.ordered !== ordered || m.bullet !== bullet || indentCols(lines[k]) > 3) break;
       if (blanks > 0 && items.length > 0) loose = true;
       const ci = m.contentIndent;
       const itemLines = [dropCols(lines[k], ci)];
+      const itemLazy = new Set();
       let q = k + 1;
+      // lazy-continuation state (marked's y / m / block-start tests on the previous line)
+      let prevBlank = blankLine(itemLines[0]);
+      let prevLead = m.spaces; // first-non-space col of the marker line's remainder
+      let prevBlock = isPrevBlockStart(itemLines[0]);
       while (q < i1) {
         const lq = lines[q];
         if (blankLine(lq)) {
@@ -1199,24 +1279,40 @@ export function parse(md) {
           while (r < i1 && blankLine(lines[r])) r++;
           if (r >= i1) break;
           const mr = matchListMarker(lines[r], indentCols(lines[r]));
-          if (mr && mr.ordered === ordered && mr.bullet === bullet && indentCols(lines[r]) === markerCol) break;
+          if (mr && mr.ordered === ordered && mr.bullet === bullet && indentCols(lines[r]) <= 3) break;
+          if (!itemLines.some(l => !blankLine(l))) break; // empty item ends at the blank line
           if (indentCols(lines[r]) >= ci) {
             for (let b = q; b < r; b++) itemLines.push('');
+            prevBlank = true;
             q = r;
             continue;
           }
           break;
         }
-        if (indentCols(lq) >= ci) { itemLines.push(stripCols(lq, ci)); q++; continue; }
-        const mq = matchListMarker(lq, indentCols(lq));
-        if (mq && mq.ordered === ordered && mq.bullet === bullet && indentCols(lq) === markerCol) break;
+        if (indentCols(lq) >= ci) {
+          const stripped = stripCols(lq, ci);
+          itemLines.push(stripped);
+          prevBlank = false;
+          prevLead = indentCols(stripped);
+          prevBlock = isPrevBlockStart(stripped);
+          q++;
+          continue;
+        }
+        // lazy paragraph continuation: previous line not blank, its content
+        // starts before col 4, it is not a fence/heading/html/HR start, and
+        // this line is not a block start at indent < ci.
+        if (!prevBlank && prevLead < 4 && !prevBlock && !listBreakLine(lq, ci)) {
+          itemLines.push(lq);
+          itemLazy.add(itemLines.length - 1);
+          prevBlank = false;
+          prevLead = Math.max(0, indentCols(lq) - ci);
+          prevBlock = isPrevBlockStart(lq);
+          q++;
+          continue;
+        }
         break;
       }
       while (itemLines.length && blankLine(itemLines[itemLines.length - 1])) itemLines.pop();
-      // blank line between two blocks inside this item -> loose
-      for (let b = 1; b < itemLines.length - 1; b++) {
-        if (blankLine(itemLines[b]) && !blankLine(itemLines[b - 1]) && !blankLine(itemLines[b + 1])) { loose = true; break; }
-      }
       let task = false, checked = false, cb = null;
       const tlines = itemLines.slice();
       if (tlines.length) {
@@ -1228,7 +1324,10 @@ export function parse(md) {
         }
       }
       const nextLine = q < i1 ? lines[q] : null;
-      const kids = lexLines(tlines, 0, tlines.length, refs, null, nextLine);
+      const kids = lexLines(tlines, 0, tlines.length, refs, itemLazy, nextLine, false);
+      // an item is loose if one of its own blocks follows a blank line, or a
+      // blank-separated link reference definition (which pushes no node) follows one
+      if (kids.some((kd, idx) => idx > 0 && kd.blankBefore) || kids.looseDef) loose = true;
       items.push({ task, checked, cb, kids });
       j = q;
     }
@@ -1238,8 +1337,9 @@ export function parse(md) {
     };
   }
   // parseParagraph: link-ref defs + paragraph / setext heading / table starting at lines[i].
-  // Pushes nodes into `nodes`, returns the next line index.
-  function parseParagraph(lines, i, i1, refs, lazy, nodes) {
+  // Pushes nodes via `push`, returns the next line index.
+  // top=false (list items): a paragraph continuation line with indent >= 4 loses 4 cols.
+  function parseParagraph(lines, i, i1, refs, lazy, push, top = true) {
     let j = i;
     while (j < i1) {
       const consumed = tryParseDef(lines, j, i1, refs);
@@ -1257,7 +1357,7 @@ export function parse(md) {
       if (para.length > 0) {
         const sl = isSetextLine(l);
         if (sl && !lazy.has(k)) {
-          nodes.push({ t: 'h', l: sl, c: para.join('\n').replace(/[ \t]+$/, '') });
+          push({ t: 'h', l: sl, c: para.join('\n').replace(/[ \t]+$/, '') });
           return k + 1;
         }
         if (para.length === 1) {
@@ -1277,20 +1377,21 @@ export function parse(md) {
                 rows.push(cells.slice(0, headCells.length));
                 r++;
               }
-              nodes.push({ t: 'table', align: td, head: headCells, rows });
+              push({ t: 'table', align: td, head: headCells, rows });
               return r;
             }
           }
         }
         if (isInterrupt(ck, indk)) break;
       }
-      para.push(l);
+      // in a list item, a paragraph continuation with indent >= 4 loses 4 cols
+      para.push(!top && para.length > 0 && indk >= 4 ? stripCols(l, 4) : l);
       k++;
     }
-    if (para.length) nodes.push({ t: 'p', c: para.join('\n') });
+    if (para.length) push({ t: 'p', c: para.join('\n') });
     if (k === i && para.length === 0) {
       // safety net: never return without consuming a line (a non-block line is a paragraph line)
-      nodes.push({ t: 'p', c: stripCols(lines[i], Math.min(indentCols(lines[i]), 3)) });
+      push({ t: 'p', c: stripCols(lines[i], Math.min(indentCols(lines[i]), 3)) });
       return i + 1;
     }
     return k;
