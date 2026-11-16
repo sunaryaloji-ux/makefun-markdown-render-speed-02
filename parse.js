@@ -300,7 +300,7 @@ export function parse(md) {
     let j = i + 1, out = '';
     while (j < n) {
       const c = s[j];
-      if (c === '\\' && j + 1 < n && PUNCT.test(s[j + 1])) { out += s[j + 1]; j += 2; continue; }
+      if (c === '\\' && j + 1 < n && PUNCT.test(s[j + 1])) { out += s[j] + s[j + 1]; j += 2; continue; }
       if (c === '[') return null;
       if (c === ']') return [out, j + 1];
       if (c === '\n' && s[j + 1] === '\n') return null;
@@ -309,13 +309,14 @@ export function parse(md) {
     }
     return null;
   }
-  function normLabel(l) { return l.replace(/\s+/g, ' ').trim().toLowerCase(); }
+  // marked's label fold: trim, collapse whitespace, lower->upper->lower
+  // (the round trip folds ẞ/ß to "ss" so [ẞ] matches [SS]).
+  // Labels compare RAW: backslash escapes are NOT unescaped (cm-545).
+  function normLabel(l) { return l.trim().replace(/\s+/g, ' ').toLowerCase().toUpperCase().toLowerCase(); }
   // label from the raw link text between brackets (for shortcut / collapsed refs)
   function labelFromRaw(s, brk, closeIdx) {
     const start = brk.img ? brk.pos + 2 : brk.pos + 1;
-    let raw = s.slice(start, closeIdx);
-    raw = raw.replace(/\\([!-/:-@\[-`{-~])/g, '$1');
-    return normLabel(raw);
+    return normLabel(s.slice(start, closeIdx));
   }
   // ---------- autolinks and raw HTML tags (inline) ----------
   const RE_SCHEME = /<([a-zA-Z][a-zA-Z0-9+.-]{1,31}:[^<>\s]*)>/y;
@@ -323,18 +324,31 @@ export function parse(md) {
   function tryAutolink(s, i) {
     RE_SCHEME.lastIndex = i;
     let m = RE_SCHEME.exec(s);
-    if (m) return { node: { k: 'auto', href: m[1], text: m[1] }, next: i + m[0].length };
+    if (m) {
+      const href = cleanUrl(m[1]);
+      if (href === null) return null;
+      return { node: { k: 'auto', href, text: m[1] }, next: i + m[0].length };
+    }
     RE_EMAIL_ANGLE.lastIndex = i;
     m = RE_EMAIL_ANGLE.exec(s);
-    if (m) return { node: { k: 'auto', href: 'mailto:' + m[1], text: m[1] }, next: i + m[0].length };
+    if (m) {
+      const href = cleanUrl('mailto:' + m[1]);
+      if (href === null) return null;
+      return { node: { k: 'auto', href, text: m[1] }, next: i + m[0].length };
+    }
     return null;
   }
   // raw HTML tag / comment / PI / CDATA / declaration starting at i. Returns {text, next} or null.
   function tryHtmlTag(s, i) {
     if (s.startsWith('<!--', i)) {
+      // abruptly-closed comments <!--> and <!---> are valid on their own
+      if (s.startsWith('<!-->', i)) return { text: '<!-->', next: i + 5 };
+      if (s.startsWith('<!--->', i)) return { text: '<!--->', next: i + 6 };
       const e = s.indexOf('-->', i + 4);
-      if (e !== -1) return { text: s.slice(i, e + 3), next: e + 3 };
-      return null;
+      if (e === -1) return null;
+      const body = s.slice(i + 4, e);
+      if (body.startsWith('>') || body.startsWith('->') || body.includes('--') || body.endsWith('-')) return null;
+      return { text: s.slice(i, e + 3), next: e + 3 };
     }
     if (s.startsWith('<?', i)) {
       const e = s.indexOf('?>', i + 2);
@@ -353,19 +367,24 @@ export function parse(md) {
     }
     const n = s.length;
     let j = i + 1;
-    if (s[j] === '/') j++;
+    let closing = false;
+    if (s[j] === '/') { closing = true; j++; }
     if (!/[a-zA-Z]/.test(s[j] || '')) return null;
     while (j < n && /[a-zA-Z0-9-]/.test(s[j])) j++;
-    while (j < n) {
-      const c = s[j];
-      if (c === '>') return { text: s.slice(i, j + 1), next: j + 1 };
-      if (c === '/' && s[j + 1] === '>') return { text: s.slice(i, j + 2), next: j + 2 };
-      if (c === ' ' || c === '\t' || c === '\n') { j++; continue; }
-      if (!/[a-zA-Z_:]/.test(c)) return null;
-      let k = j;
-      while (k < n && /[a-zA-Z0-9_.:-]/.test(s[k])) k++;
-      if (k === j) return null;
-      j = k;
+    if (closing) {
+      // closing tag: only optional whitespace, then '>'
+      while (j < n && (s[j] === ' ' || s[j] === '\t' || s[j] === '\n')) j++;
+      if (s[j] === '>') return { text: s.slice(i, j + 1), next: j + 1 };
+      return null;
+    }
+    for (;;) {
+      const wsStart = j;
+      while (j < n && (s[j] === ' ' || s[j] === '\t' || s[j] === '\n')) j++;
+      if (s[j] === '>') return { text: s.slice(i, j + 1), next: j + 1 };
+      if (s[j] === '/' && s[j + 1] === '>') return { text: s.slice(i, j + 2), next: j + 2 };
+      if (j === wsStart) return null; // attribute must follow whitespace
+      if (!/[a-zA-Z_:]/.test(s[j] || '')) return null;
+      while (j < n && /[a-zA-Z0-9_.:-]/.test(s[j])) j++;
       while (j < n && (s[j] === ' ' || s[j] === '\t' || s[j] === '\n')) j++;
       if (s[j] === '=') {
         j++;
@@ -383,7 +402,6 @@ export function parse(md) {
         }
       }
     }
-    return null;
   }
   // GFM autolink: www. / http(s):// URL, or bare email, starting at i.
   // Returns {href, text, next} or null. prevCh is the char before i ('' at start).
@@ -419,6 +437,8 @@ export function parse(md) {
               }
             }
           }
+          href = cleanUrl(href);
+          if (href === null) return null;
           return { href, text, next, start };
         }
       }
@@ -448,7 +468,9 @@ export function parse(md) {
       if (!changed) break;
     }
     if (!url) return null;
-    const href = m[0].startsWith('www.') ? 'http://' + url : url;
+    let href = m[0].startsWith('www.') ? 'http://' + url : url;
+    href = cleanUrl(href);
+    if (href === null) return null;
     return { href, text: url, next: i + url.length, start: i };
   }
   // tryLink(s, j, brk, refs): attempt a link whose ']' ends at j-1. j = index after ']'.
@@ -460,30 +482,30 @@ export function parse(md) {
       i++;
       while (i < n && (s[i] === ' ' || s[i] === '\t' || s[i] === '\n')) i++;
       let dest = '';
+      let ok = true;
       if (i < n && s[i] !== ')') {
         const d = parseDest(s, i);
-        if (!d) return null;
-        dest = d[0]; i = d[1];
+        if (!d) ok = false;
+        else { dest = d[0]; i = d[1]; }
       }
-      let m = i;
-      while (m < n && (s[m] === ' ' || s[m] === '\t' || s[m] === '\n')) m++;
-      let title = null;
-      if (m < n && (s[m] === '"' || s[m] === "'" || s[m] === '(')) {
-        const t = parseTitle(s, m);
-        if (!t) return null;
-        title = t[0]; m = t[1];
-        let q = m;
-        q = skipDefWS(s, q);
-        m = q;
+      let m = i, title = null;
+      if (ok) {
+        while (m < n && (s[m] === ' ' || s[m] === '\t' || s[m] === '\n')) m++;
+        if (m < n && (s[m] === '"' || s[m] === "'" || s[m] === '(')) {
+          const t = parseTitle(s, m);
+          if (!t) ok = false;
+          else {
+            title = t[0]; m = t[1];
+            m = skipDefWS(s, m);
+          }
+        }
       }
-      if (m < n && s[m] === ')') {
+      if (ok && m < n && s[m] === ')') {
         const href = cleanUrl(dest);
-        if (href === null) return null;
-        return { href, title, next: m + 1 };
+        if (href !== null) return { href, title, next: m + 1 };
       }
-      return null;
-    }
-    if (s[i] === '[') {
+      // Inline link failed: fall through to the shortcut reference link.
+    } else if (s[i] === '[') {
       const lab = parseLabel(s, i);
       if (!lab) return null;
       const key = lab[0] === '' ? labelFromRaw(s, brk, j - 1) : normLabel(lab[0]);
@@ -917,6 +939,7 @@ export function parse(md) {
     const lab = parseLabel(s, 0);
     if (!lab || lab[0] === '') return 0;
     const key = normLabel(lab[0]);
+    if (!key) return 0; // label normalising to empty (e.g. only whitespace) is not a def
     let p = lab[1];
     if (s[p] !== ':') return 0;
     p++;
