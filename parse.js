@@ -389,17 +389,37 @@ export function parse(md) {
   // Returns {href, text, next} or null. prevCh is the char before i ('' at start).
   function tryGfmAutolink(s, i, prevCh) {
     const n = s.length;
-    // email: scan back is done by the caller; here i is the email start
+    // email: scan back is done by the caller; here i is the email start.
+    // marked's GFM email: local [A-Za-z0-9._+-]+, domain labels [A-Za-z0-9-_],
+    // last label alnum, and no word char / hyphen may follow the match.
+    // The match may start after a non-local char inside the scanned word
+    // (e.g. a!b@c.d links only b@c.d), so search unanchored.
     if (/[a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]/.test(s[i] || '')) {
-      // try email first only when an '@' is ahead in this word
       let j = i;
-      while (j < n && /[a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]/.test(s[j])) j++;
+      while (j < n && /[a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~@-]/.test(s[j])) j++;
       const word = s.slice(i, j);
-      const at = word.indexOf('@');
-      if (at > 0) {
-        const m2 = /^([a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+)/.exec(word);
-        if (m2 && (prevCh === '' || !/[a-zA-Z0-9]/.test(prevCh))) {
-          return { href: 'mailto:' + m2[1], text: m2[1], next: i + m2[1].length };
+      const em = /[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])/.exec(word);
+      if (em) {
+        const abs = i + em.index;
+        const pc = abs > 0 ? s[abs - 1] : '';
+        if (pc === '' || !/[a-zA-Z0-9]/.test(pc)) {
+          let start = abs, text = em[0], href = 'mailto:' + em[0], next = abs + em[0].length;
+          let scheme = null;
+          if (abs >= 7 && s.slice(abs - 7, abs) === 'mailto:') scheme = 'mailto:';
+          else if (abs >= 5 && s.slice(abs - 5, abs) === 'xmpp:') scheme = 'xmpp:';
+          if (scheme) {
+            const bs = abs - scheme.length - 1;
+            if (bs < 0 || !/[a-zA-Z0-9]/.test(s[bs])) {
+              start = abs - scheme.length;
+              text = scheme + em[0];
+              href = scheme + em[0];
+              if (scheme === 'xmpp:') {
+                const rm = /^\/[A-Za-z0-9@.]+/.exec(s.slice(next));
+                if (rm) { text += rm[0]; href += rm[0]; next += rm[0].length; }
+              }
+            }
+          }
+          return { href, text, next, start };
         }
       }
     }
@@ -429,7 +449,7 @@ export function parse(md) {
     }
     if (!url) return null;
     const href = m[0].startsWith('www.') ? 'http://' + url : url;
-    return { href, text: url, next: i + url.length };
+    return { href, text: url, next: i + url.length, start: i };
   }
   // tryLink(s, j, brk, refs): attempt a link whose ']' ends at j-1. j = index after ']'.
   // Returns {href, title, next} or null.
@@ -628,7 +648,17 @@ export function parse(md) {
       let j = i;
       while (j < n) {
         const ch = s[j];
-        if (ch === '\\' || ch === '`' || ch === '*' || ch === '_' || ch === '[' || ch === ']' || ch === '<' || ch === '&' || ch === '~' || ch === '\n') break;
+        if (ch === '_') {
+          // An inert '_' run (can neither open nor close emphasis) is plain
+          // text: keep it in the run so emails/URLs spanning it still link.
+          let k = j; while (k < n && s[k] === '_') k++;
+          const f = flank(j, k);
+          const canOpen = f.left && (!f.right || UNI_PUNCT.test(s[j - 1] || ''));
+          const canClose = f.right && (!f.left || UNI_PUNCT.test(s[k] || ''));
+          if (canOpen || canClose) break;
+          j = k; continue;
+        }
+        if (ch === '\\' || ch === '`' || ch === '*' || ch === '[' || ch === ']' || ch === '<' || ch === '&' || ch === '~' || ch === '\n') break;
         if (ch === '!' && s[j + 1] === '[') break;
         j++;
       }
@@ -648,7 +678,7 @@ export function parse(md) {
           if (st < p) { buf += s.slice(p, cp + 1); p = cp + 1; continue; }
           const g = tryGfmAutolink(s, st, st > 0 ? s[st - 1] : '');
           if (g) {
-            buf += s.slice(p, st); flush();
+            buf += s.slice(p, g.start); flush();
             nodes.push({ k: 'auto', href: g.href, text: g.text });
             i = g.next; done = true;
           } else { buf += s.slice(p, cp + 1); p = cp + 1; }
